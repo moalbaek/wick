@@ -255,6 +255,11 @@ void board_apply_rotation(void)
     }
 }
 
+void board_diag(char *buf, size_t len)
+{
+    if (len) buf[0] = 0;
+}
+
 typedef struct {
     bool down;
     int64_t since;

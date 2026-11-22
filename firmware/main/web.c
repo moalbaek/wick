@@ -1,7 +1,9 @@
 #include "web.h"
 #include "app.h"
 #include "app_state.h"
+#include "board.h"
 #include "config.h"
+#include "ui.h"
 #include "settings.h"
 #include "spotify.h"
 #include "wifi.h"
@@ -466,8 +468,20 @@ static esp_err_t settings_page(httpd_req_t *req)
     sendf(req, "<section><h2>About</h2><p>Firmware %s (%s) · IP %s · free memory %u KB</p>"
                "<div class=row><form method=post action='/update'><button class=secondary>Check for update</button></form>"
                "<form method=post action='/forget-wifi' onsubmit=\"return confirm('Forget the Wi-Fi and restart in setup mode?')\">"
-               "<button class=secondary>Change Wi-Fi</button></form></div></section>",
+               "<button class=secondary>Change Wi-Fi</button></form></div>",
           d->version, CONFIG_KP_BOARD_NAME, ip, (unsigned)(esp_get_free_heap_size() / 1024));
+    // Counters since start, so smoothness problems can be reported with numbers.
+    ui_diag_t ud;
+    ui_get_diag(&ud);
+    char bd[128];
+    board_diag(bd, sizeof(bd));
+    char fps[24] = "not swiped yet";
+    if (ud.scroll_fps) snprintf(fps, sizeof(fps), "%d fps", ud.scroll_fps);
+    sendf(req, "<p class=muted>Screen while swiping: %s · longest pause %d ms%s%s · internal memory %u KB free "
+               "(largest block %u KB)</p></section>",
+          fps, ud.longest_pause_ms, bd[0] ? " · " : "", bd,
+          (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+          (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
     heap_caps_free(snap);
     return page_end(req);
 }

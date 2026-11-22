@@ -1,6 +1,7 @@
 // Hardware abstraction for the two supported boards.
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include "lvgl.h"
 
 typedef enum {
@@ -31,3 +32,6 @@ void board_power_off(void);
 
 // Apply orientation settings (strip: flip 180 degrees).
 void board_apply_rotation(void);
+
+// One line of hardware counters for the settings page (empty if the board has none).
+void board_diag(char *buf, size_t len);

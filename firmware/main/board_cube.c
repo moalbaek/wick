@@ -3,13 +3,18 @@
 #include "sdkconfig.h"
 #if CONFIG_KP_BOARD_CUBE
 #include "board.h"
+#include "config.h"
 #include "settings.h"
 #include "bsp/esp-bsp.h"
+#include "bsp/display.h"
+#include "bsp/touch.h"
 #include "esp_lv_adapter.h"
+#include "esp_lcd_touch.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include <stdio.h>
 
 static const char *TAG = "cube";
 static i2c_master_dev_handle_t s_pmu;
@@ -17,6 +22,170 @@ static i2c_master_dev_handle_t s_pmu;
 #define PMU_ADDR 0x34
 #define GPIO_KEY3 GPIO_NUM_18
 #define GPIO_BOOT GPIO_NUM_0
+
+// Draw buffers live in internal RAM: the SPI driver can send them directly. In PSRAM (the BSP default)
+// rendering is slower and the driver copies every strip into a fresh internal buffer before sending it.
+// 2 x 24 lines = 45 KB, allocated once at boot; that is less than the copy the driver used to allocate per strip.
+#define DRAW_LINES 24
+
+// ---------------------------------------------------------------- touch (CST92xx)
+// Read here instead of through the Waveshare driver: it never acknowledges a report, so current CST92xx
+// firmware holds each report until its own timeout, and when a read fails it sleeps and resets the
+// controller inside the LVGL task. The protocol follows Espressif's esp_lcd_touch_cst9220 driver.
+// Touch is polled every LVGL input period (16 ms) instead of waiting for the interrupt pin: esp_lvgl_adapter
+// 0.6.x skips a sample it could not read and then keeps reporting the old finger position.
+
+#define TOUCH_ADDR 0x5A
+#define TOUCH_REPORT_LEN 15            // up to 2 points x 5 bytes + 5 header bytes
+#define TOUCH_PROJECT_LEGACY 0x542F    // older firmware that must not get the acknowledgement
+#define TOUCH_STALE_US 300000          // a finger on the glass keeps producing reports; this much silence = gone
+
+static i2c_master_dev_handle_t s_touch;
+static bool s_touch_ack = true;
+static int64_t s_touch_last_report;
+static uint32_t s_touch_reports, s_touch_errors, s_touch_stale;
+
+static esp_err_t touch_read_reg(uint16_t reg, uint8_t *buf, size_t len)
+{
+    const uint8_t r[2] = {reg >> 8, reg & 0xFF};
+    esp_err_t err = i2c_master_transmit(s_touch, r, sizeof(r), 20);
+    return err == ESP_OK ? i2c_master_receive(s_touch, buf, len, 20) : err;
+}
+
+// esp_lcd_touch read_data: decode one report into tp->data. Always returns ESP_OK; errors keep the last state.
+static esp_err_t touch_read(esp_lcd_touch_handle_t tp)
+{
+    uint8_t r[TOUCH_REPORT_LEN] = {0};
+    int points = -1;  // -1: no new report
+    uint16_t x = 0, y = 0;
+    if (touch_read_reg(0xD000, r, sizeof(r)) != ESP_OK) {
+        s_touch_errors++;
+    } else {
+        if (s_touch_ack) {  // releases the report so the controller can publish the next one
+            static const uint8_t ack[3] = {0xD0, 0x00, 0xAB};
+            if (i2c_master_transmit(s_touch, ack, sizeof(ack), 20) != ESP_OK) s_touch_errors++;
+        }
+        bool empty = true;
+        for (int i = 0; i < 7; i++) empty = empty && r[i] == 0;
+        int n = r[5] & 0x7F;
+        if (empty) {
+            points = 0;
+        } else if (r[0] != 0xAB && r[6] == 0xAB && n <= 2) {  // r[0] == 0xAB: nothing new since the last one
+            points = 0;
+            for (int i = 0; i < n; i++) {
+                const uint8_t *p = &r[i == 0 ? 0 : i * 5 + 2];
+                if (((p[0] & 0x0F) >> 1) == 3) {  // release records keep the old position, so filter on status
+                    x = (uint16_t)(p[1] << 4 | p[3] >> 4);
+                    y = (uint16_t)(p[2] << 4 | (p[3] & 0x0F));
+                    points = 1;
+                    break;
+                }
+            }
+        }
+    }
+    int64_t now = esp_timer_get_time();
+    if (points >= 0) {
+        s_touch_reports++;
+        s_touch_last_report = now;
+    }
+    portENTER_CRITICAL(&tp->data.lock);
+    if (points >= 0) {
+        tp->data.points = points;
+        if (points) {
+            tp->data.coords[0].x = x;
+            tp->data.coords[0].y = y;
+            tp->data.coords[0].strength = 1;
+            tp->data.coords[0].track_id = 0;
+        }
+    } else if (tp->data.points && now - s_touch_last_report > TOUCH_STALE_US) {
+        tp->data.points = 0;  // never hold a finger that has stopped reporting
+        s_touch_stale++;
+    }
+    portEXIT_CRITICAL(&tp->data.lock);
+    return ESP_OK;
+}
+
+static void touch_start(lv_display_t *disp)
+{
+    // Same orientation as bsp_display_start(). The Waveshare driver still does the reset and setup.
+    bsp_display_cfg_t cfg = {.touch_flags = {.swap_xy = 1, .mirror_x = 0, .mirror_y = 1}};
+    esp_lcd_touch_handle_t tp = NULL;
+    if (bsp_touch_new(&cfg, &tp) != ESP_OK || !tp) {
+        ESP_LOGW(TAG, "touch not available");
+        return;
+    }
+    i2c_device_config_t dc = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = TOUCH_ADDR,
+        .scl_speed_hz = 400000,
+    };
+    if (i2c_master_bus_add_device(bsp_i2c_get_handle(), &dc, &s_touch) == ESP_OK) {
+        uint8_t id[4] = {0};
+        if (touch_read_reg(0xD204, id, sizeof(id)) == ESP_OK) {
+            uint16_t project = id[0] | id[1] << 8, chip = id[2] | id[3] << 8;
+            s_touch_ack = project != TOUCH_PROJECT_LEGACY;
+            ESP_LOGI(TAG, "touch chip 0x%04x, project 0x%04x", chip, project);
+        }
+        tp->read_data = touch_read;
+        gpio_intr_disable(tp->config.int_gpio_num);
+        tp->config.int_gpio_num = GPIO_NUM_NC;  // the adapter polls when there is no interrupt pin
+    } else {
+        s_touch = NULL;
+        ESP_LOGW(TAG, "touch: using the Waveshare driver");
+    }
+    esp_lv_adapter_touch_config_t tc = ESP_LV_ADAPTER_TOUCH_DEFAULT_CONFIG(disp, tp);
+    if (!esp_lv_adapter_register_touch(&tc)) ESP_LOGW(TAG, "touch registration failed");
+}
+
+// The CO5300 needs areas that start on an even and end on an odd pixel (as in the BSP).
+static void rounder_cb(lv_event_t *e)
+{
+    lv_area_t *a = lv_event_get_param(e);
+    a->x1 &= ~1;
+    a->y1 &= ~1;
+    a->x2 |= 1;
+    a->y2 |= 1;
+}
+
+// bsp_display_start() with three changes: internal draw buffers, the LVGL task on core 1 (Wi-Fi, TLS and
+// cover decoding run on core 0), and our own touch reading.
+static lv_display_t *display_start(void)
+{
+    esp_lv_adapter_config_t acfg = ESP_LV_ADAPTER_DEFAULT_CONFIG();
+    acfg.task_core_id = 1;
+    if (esp_lv_adapter_init(&acfg) != ESP_OK) return NULL;
+    const bsp_display_config_t pcfg = {.max_transfer_sz = KP_SCREEN_W * KP_SCREEN_H * 2};
+    esp_lcd_panel_handle_t panel = NULL;
+    esp_lcd_panel_io_handle_t io = NULL;
+    if (bsp_display_new(&pcfg, &panel, &io) != ESP_OK) return NULL;
+    esp_lv_adapter_display_config_t dcfg = {
+        .panel = panel,
+        .panel_io = io,
+        .profile = {
+            .interface = ESP_LV_ADAPTER_PANEL_IF_OTHER,
+            .rotation = ESP_LV_ADAPTER_ROTATE_0,
+            .hor_res = KP_SCREEN_W,
+            .ver_res = KP_SCREEN_H,
+            .buffer_height = DRAW_LINES,
+            .use_psram = false,
+            .enable_ppa_accel = false,
+            .require_double_buffer = true,
+        },
+        .tear_avoid_mode = ESP_LV_ADAPTER_TEAR_AVOID_MODE_NONE,
+    };
+    lv_display_t *disp = esp_lv_adapter_register_display(&dcfg);
+    if (!disp) {  // slower, but better than no screen
+        ESP_LOGW(TAG, "no internal RAM for draw buffers, using PSRAM");
+        dcfg.profile.use_psram = true;
+        disp = esp_lv_adapter_register_display(&dcfg);
+    }
+    if (!disp) return NULL;
+    lv_display_add_event_cb(disp, rounder_cb, LV_EVENT_INVALIDATE_AREA, NULL);
+    touch_start(disp);
+    bsp_display_brightness_init();
+    if (esp_lv_adapter_start() != ESP_OK) return NULL;
+    return disp;
+}
 
 static esp_err_t pmu_read(uint8_t reg, uint8_t *val)
 {
@@ -72,9 +241,20 @@ lv_display_t *board_init(void)
     gpio_config(&io);
     bsp_i2c_init();
     pmu_init();
-    lv_display_t *disp = bsp_display_start();
+    lv_display_t *disp = display_start();
     if (disp) bsp_display_brightness_set(100);
     return disp;
+}
+
+void board_diag(char *buf, size_t len)
+{
+    if (!s_touch) {
+        snprintf(buf, len, "touch: Waveshare driver");
+        return;
+    }
+    snprintf(buf, len, "touch: %lu reports, %lu read errors, %lu stuck presses cleared%s",
+             (unsigned long)s_touch_reports, (unsigned long)s_touch_errors, (unsigned long)s_touch_stale,
+             s_touch_ack ? "" : " (older touch firmware)");
 }
 
 // The adapter's lock is recursive. Call it directly: bsp_display_lock(0) does not wait (0 = try once in
