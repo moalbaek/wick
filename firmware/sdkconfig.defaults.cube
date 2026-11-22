@@ -1,1 +1,5 @@
 CONFIG_KP_BOARD_CUBE=y
+
+# LVGL draws in the cube's own LVGL task (pinned to core 1, see board_cube.c). With the FreeRTOS OS layer it
+# draws in a separate priority-3 task with no core affinity, which competes with cover downloads and decoding.
+CONFIG_LV_OS_NONE=y

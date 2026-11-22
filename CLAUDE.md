@@ -44,8 +44,8 @@ make -C sim
   the LVGL task or the HTTP server task (exception: `/callback` finishes the login token exchange).
 - **LVGL is not thread safe.** Every `ui_*` function takes `board_lock(-1)` itself. Code in LVGL event
   callbacks already holds the lock. Lock order is LVGL lock, then the images mutex, never the reverse.
-  On the cube, `board_lock` calls `esp_lv_adapter_lock` directly: `bsp_display_lock(0)` does not wait and
-  its bool return is inverted.
+  Both boards run their own LVGL task with a recursive mutex behind `board_lock` (esp_lvgl_adapter and
+  `bsp_display_lock` are not used).
 - **The UI copies what it shows** (ids, cover URLs, label text), so the app can replace its lists any time.
 - **Lists are double-buffered** (`s_home/_spare`, `s_tracks/_spare`): load into the spare, swap on success.
 - **Taps carry a token.** `CMD_PLAY` includes `s_list_token`; bump it whenever the song list on screen
@@ -89,15 +89,20 @@ make -C sim
 ## Hardware notes
 
 - Cube (Waveshare ESP32-S3-Touch-AMOLED-2.16): BSP `waveshare/esp32_s3_touch_amoled_2_16` + esp_lvgl_adapter.
-  `board_cube.c` starts the display itself instead of `bsp_display_start()`: draw buffers in internal RAM
-  (PSRAM buffers made the SPI driver copy every strip), the LVGL task pinned to core 1, and touch read by our
-  own LVGL input device (one read of 0xD000, then the 0xD0 0x00 0xAB acknowledgement; polled, no interrupt
-  pin). Decoding and fault handling are in `cst92xx.c` (host-tested): a press with no usable sample for 300 ms
+  `board_cube.c` has its own LVGL port; only `bsp_display_new()` (QSPI bus + CO5300 init) and `bsp_touch_new()`
+  come from the BSP. The panel's TE pin is not connected on this board, so writes can't follow its refresh.
+  LVGL renders full frames into two PSRAM buffers (full render mode); a sender task on core 0 sends each frame
+  in 16-px vertical slices (gathered and byte-swapped into two internal DMA buffers) while LVGL renders the
+  next, so a half-written frame shows as a vertical seam instead of a horizontal cut. LVGL waits through
+  `flush_wait_cb` (one `s_frame_sent` per frame; the sender never calls `lv_display_flush_ready`). The LVGL
+  task is pinned to core 1 and `CONFIG_LV_OS_NONE` (sdkconfig.defaults.cube) keeps drawing in it, not in an
+  unpinned priority-3 draw thread. Brightness commands take `s_panel_mutex` so they never land mid-frame.
+  Touch is read by our own LVGL input device (one read of 0xD000, then the 0xD0 0x00 0xAB acknowledgement;
+  polled, no interrupt pin). Decoding and fault handling are in `cst92xx.c` (host-tested): a press with no usable sample for 300 ms
   is cancelled without becoming a tap (`lv_indev_wait_release`, or a plain release if a drag was scrolling),
   and that finger is ignored until the controller reports it lifted. A report whose acknowledgement failed is
   not a usable sample. The Waveshare touch driver never acknowledges, which makes the controller hold reports,
-  and resets the chip inside the LVGL task on errors. The BSP pins esp_lvgl_adapter to ~0.6 (no IRQ sample
-  recovery before 0.7.7), so the adapter's touch layer isn't used.
+  and resets the chip inside the LVGL task on errors.
   KEY3 = GPIO18, BOOT = GPIO0. AXP2101 at I2C 0x34 (shared BSP bus): power-key IRQ status reg 0x49
   (bit3 short, bit2 long), battery % at 0xA4, power off = 0x10 bit0.
 - Strip (Waveshare ESP32-S3-Touch-LCD-3.49 **V2**; V1 has different pins): AXS15231B QSPI on SPI3
