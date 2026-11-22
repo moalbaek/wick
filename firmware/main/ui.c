@@ -70,6 +70,9 @@ static lv_timer_t *s_vol_timer, *s_toast_timer;
 static lv_obj_t *s_search_ta;  // search text field while the keyboard is shown
 static int s_desired_brightness = 100;
 static int s_applied_brightness = 100;
+#define TICK_MS 120
+// Cards' scroll position at the last tick and at the last frame; -1: no cards, or they were just rebuilt.
+static int32_t s_last_scroll_x = -1, s_render_x = -1;
 
 int ui_desired_brightness(void) { return s_desired_brightness; }
 
@@ -86,6 +89,7 @@ static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, lv_color_t color
 
 static void release_slots(void)
 {
+    s_last_scroll_x = s_render_x = -1;  // see measure() and render_ready_cb()
     for (int i = 0; i < s_nslots; i++) {
         if (s_slots[i].dsc) {
             lv_image_set_src(s_slots[i].img, NULL);
@@ -215,8 +219,52 @@ static void dim_screen(void)
     }
 }
 
+// ---------------------------------------------------------------- smoothness counters (settings page)
+
+static uint32_t s_last_tick, s_last_render;
+static uint32_t s_scroll_frames, s_scroll_ms;
+static int s_longest_pause_ms;
+
+// Frame rate while the cards move: a frame counts the time since the previous frame when both moved the cards.
+// The first frame of a swipe would count the idle time before it; gaps of 1 s or more show up as a pause.
+static void render_ready_cb(lv_event_t *e)
+{
+    static bool prev_moved;
+    uint32_t now = lv_tick_get();
+    int32_t x = s_pager ? lv_obj_get_scroll_x(s_pager) : -1;
+    bool moved = x >= 0 && s_render_x >= 0 && x != s_render_x;
+    if (moved && prev_moved && now - s_last_render < 1000) {
+        s_scroll_frames++;
+        s_scroll_ms += now - s_last_render;
+    }
+    prev_moved = moved;
+    s_render_x = x;
+    s_last_render = now;
+}
+
+// A late tick means the LVGL task was blocked. Only between two ticks on the same cards: building a screen
+// also blocks the task, but that is not browsing.
+static void measure(void)
+{
+    uint32_t now = lv_tick_get();
+    int32_t x = s_pager ? lv_obj_get_scroll_x(s_pager) : -1;
+    if (s_last_tick && s_last_scroll_x >= 0 && x >= 0) {
+        int late = (int)(now - s_last_tick) - TICK_MS;
+        if (late > s_longest_pause_ms) s_longest_pause_ms = late;
+    }
+    s_last_scroll_x = x;
+    s_last_tick = now;
+}
+
+void ui_get_diag(ui_diag_t *d)
+{
+    d->scroll_fps = s_scroll_ms ? (int)(s_scroll_frames * 1000ULL / s_scroll_ms) : 0;
+    d->longest_pause_ms = s_longest_pause_ms;
+}
+
 static void tick_cb(lv_timer_t *t)
 {
+    measure();
     if (!s_update_overlay) {
         manage_images();
         follow_now_playing();
@@ -290,7 +338,8 @@ void ui_init(lv_display_t *disp)
     lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, 0);
     lv_obj_set_scrollable(s_root, false);
     make_overlays();
-    lv_timer_create(tick_cb, 120, NULL);
+    lv_timer_create(tick_cb, TICK_MS, NULL);
+    lv_display_add_event_cb(disp, render_ready_cb, LV_EVENT_RENDER_READY, NULL);
     board_unlock();
 }
 

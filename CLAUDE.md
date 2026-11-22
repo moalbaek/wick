@@ -89,6 +89,15 @@ make -C sim
 ## Hardware notes
 
 - Cube (Waveshare ESP32-S3-Touch-AMOLED-2.16): BSP `waveshare/esp32_s3_touch_amoled_2_16` + esp_lvgl_adapter.
+  `board_cube.c` starts the display itself instead of `bsp_display_start()`: draw buffers in internal RAM
+  (PSRAM buffers made the SPI driver copy every strip), the LVGL task pinned to core 1, and touch read by our
+  own LVGL input device (one read of 0xD000, then the 0xD0 0x00 0xAB acknowledgement; polled, no interrupt
+  pin). Decoding and fault handling are in `cst92xx.c` (host-tested): a press with no usable sample for 300 ms
+  is cancelled without becoming a tap (`lv_indev_wait_release`, or a plain release if a drag was scrolling),
+  and that finger is ignored until the controller reports it lifted. A report whose acknowledgement failed is
+  not a usable sample. The Waveshare touch driver never acknowledges, which makes the controller hold reports,
+  and resets the chip inside the LVGL task on errors. The BSP pins esp_lvgl_adapter to ~0.6 (no IRQ sample
+  recovery before 0.7.7), so the adapter's touch layer isn't used.
   KEY3 = GPIO18, BOOT = GPIO0. AXP2101 at I2C 0x34 (shared BSP bus): power-key IRQ status reg 0x49
   (bit3 short, bit2 long), battery % at 0xA4, power off = 0x10 bit0.
 - Strip (Waveshare ESP32-S3-Touch-LCD-3.49 **V2**; V1 has different pins): AXS15231B QSPI on SPI3

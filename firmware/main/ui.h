@@ -44,3 +44,10 @@ void ui_wake(void);  // count a button press as activity (wakes the screen)
 // Screen dimming: the UI decides, the button task applies it outside the LVGL lock.
 int ui_desired_brightness(void);
 void ui_applied_brightness(int b);
+
+// Smoothness since start, for the settings page. scroll_fps is 0 until the cards have been swiped.
+typedef struct {
+    int scroll_fps;        // frames drawn per second while the cards were moving
+    int longest_pause_ms;  // longest time the screen task was blocked
+} ui_diag_t;
+void ui_get_diag(ui_diag_t *d);
