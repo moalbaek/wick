@@ -7,6 +7,7 @@
 #include "kp_util.h"
 #include "sonos_proto.h"
 #include "spotify_parse.h"
+#include "cst92xx.h"
 
 static int fails = 0, passes = 0;
 #define CHECK(cond) do { if (cond) passes++; else { fails++; printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
@@ -272,11 +273,115 @@ static void test_spotify(void)
     CHECK(!sp_parse_playlists("not json", "Kids:", "me", pl, &n, 8, next, sizeof(next)));
 }
 
+// A CST92xx report with one record: status 0x06 = touching, 0x00 = released (keeps the old position).
+static void report(uint8_t *r, uint8_t status, int x, int y)
+{
+    memset(r, 0, CST92XX_REPORT_LEN);
+    r[0] = status;
+    r[1] = (uint8_t)(x >> 4);
+    r[2] = (uint8_t)(y >> 4);
+    r[3] = (uint8_t)((x & 0x0F) << 4 | (y & 0x0F));
+    r[5] = 1;
+    r[6] = 0xAB;
+}
+
+// Feeds one sample every 16 ms (the LVGL input period) and counts what the UI would see.
+typedef struct {
+    cst_tracker_t t;
+    int64_t now;
+    int taps;     // press followed by a normal release (LVGL sends CLICKED if nothing scrolled)
+    int cancels;
+    bool down;
+    cst_out_t last;
+} touch_sim_t;
+
+static void feed(touch_sim_t *s, cst_sample_t smp, int ms)
+{
+    for (int t = 0; t < ms; t += 16) {
+        s->now += 16000;
+        cst_out_t o = cst92xx_track(&s->t, smp, s->now);
+        if (o == CST_OUT_CANCEL) s->cancels++;
+        else if (o == CST_OUT_UP && s->down) s->taps++;
+        s->down = o == CST_OUT_DOWN;
+        s->last = o;
+    }
+}
+
+static void test_touch(void)
+{
+    uint8_t r[CST92XX_REPORT_LEN];
+    report(r, 0x06, 300, 123);
+    cst_sample_t s = cst92xx_decode(r, true, true);
+    CHECK(s.kind == CST_SAMPLE_DOWN && s.x == 300 && s.y == 123);
+    report(r, 0x00, 300, 123);
+    CHECK(cst92xx_decode(r, true, true).kind == CST_SAMPLE_UP);  // release record, old position
+    CHECK(cst92xx_decode(r, false, true).kind == CST_SAMPLE_FAILED);
+    report(r, 0x06, 300, 123);
+    CHECK(cst92xx_decode(r, true, false).kind == CST_SAMPLE_FAILED);  // not acknowledged: held, not fresh
+    r[6] = 0x12;
+    CHECK(cst92xx_decode(r, true, true).kind == CST_SAMPLE_FAILED);  // malformed
+    report(r, 0x06, 300, 123);
+    r[5] = 3;
+    CHECK(cst92xx_decode(r, true, true).kind == CST_SAMPLE_FAILED);  // more records than we read
+    memset(r, 0, sizeof(r));
+    CHECK(cst92xx_decode(r, true, true).kind == CST_SAMPLE_UP);
+    r[0] = 0xAB;
+    CHECK(cst92xx_decode(r, true, true).kind == CST_SAMPLE_NO_NEWS);
+    report(r, 0x00, 1, 2);  // first finger released, second still touching
+    r[5] = 2;
+    r[7] = 0x16;
+    r[8] = 400 >> 4;
+    r[9] = 50 >> 4;
+    r[10] = (400 & 0x0F) << 4 | (50 & 0x0F);
+    s = cst92xx_decode(r, true, true);
+    CHECK(s.kind == CST_SAMPLE_DOWN && s.x == 400 && s.y == 50);
+
+    const cst_sample_t down = {CST_SAMPLE_DOWN, 200, 200}, up = {CST_SAMPLE_UP, 0, 0};
+    const cst_sample_t failed = {CST_SAMPLE_FAILED, 0, 0}, quiet = {CST_SAMPLE_NO_NEWS, 0, 0};
+
+    // A normal tap.
+    touch_sim_t a = {0};
+    feed(&a, down, 100);
+    feed(&a, up, 50);
+    CHECK(a.taps == 1 && a.cancels == 0);
+
+    // Review case 1: press, 480 ms of failed reads, the same finger reports again, then is lifted.
+    // The press is cancelled once and neither the outage nor the lift becomes a tap.
+    touch_sim_t b = {0};
+    feed(&b, down, 64);
+    feed(&b, failed, 480);
+    CHECK(b.cancels == 1 && b.taps == 0 && b.last == CST_OUT_UP);
+    feed(&b, down, 200);
+    CHECK(b.last == CST_OUT_UP);
+    feed(&b, up, 50);
+    CHECK(b.cancels == 1 && b.taps == 0);
+    feed(&b, down, 100);  // the next touch works again
+    feed(&b, up, 50);
+    CHECK(b.taps == 1);
+
+    // Review case 2: the acknowledgement keeps failing, so the controller keeps returning the held press.
+    touch_sim_t c = {0};
+    feed(&c, down, 64);
+    report(r, 0x06, 200, 200);
+    feed(&c, cst92xx_decode(r, true, false), 560);
+    CHECK(c.cancels == 1 && c.taps == 0 && c.last == CST_OUT_UP);
+
+    // Outages shorter than the limit keep the press; a healthy controller with nothing new keeps it forever.
+    touch_sim_t d = {0};
+    feed(&d, down, 64);
+    feed(&d, failed, 240);
+    feed(&d, quiet, 3000);
+    CHECK(d.cancels == 0 && d.last == CST_OUT_DOWN);
+    feed(&d, up, 32);
+    CHECK(d.taps == 1);
+}
+
 int main(void)
 {
     test_util();
     test_sonos();
     test_spotify();
+    test_touch();
     printf("%d passed, %d failed\n", passes, fails);
     return fails ? 1 : 0;
 }

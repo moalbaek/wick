@@ -4,6 +4,7 @@
 #if CONFIG_KP_BOARD_CUBE
 #include "board.h"
 #include "config.h"
+#include "cst92xx.h"
 #include "settings.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
@@ -31,19 +32,18 @@ static i2c_master_dev_handle_t s_pmu;
 // ---------------------------------------------------------------- touch (CST92xx)
 // Read here instead of through the Waveshare driver: it never acknowledges a report, so current CST92xx
 // firmware holds each report until its own timeout, and when a read fails it sleeps and resets the
-// controller inside the LVGL task. The protocol follows Espressif's esp_lcd_touch_cst9220 driver.
-// Touch is polled every LVGL input period (16 ms) instead of waiting for the interrupt pin: esp_lvgl_adapter
-// 0.6.x skips a sample it could not read and then keeps reporting the old finger position.
+// controller inside the LVGL task. Decoding and fault handling are in cst92xx.c.
+// Our own LVGL input device, polled every input period (16 ms) instead of waiting for the interrupt pin:
+// esp_lvgl_adapter 0.6.x skips a sample it could not read and then keeps reporting the old finger position,
+// and only the input device can end a press without LVGL counting it as a tap.
 
 #define TOUCH_ADDR 0x5A
-#define TOUCH_REPORT_LEN 15            // up to 2 points x 5 bytes + 5 header bytes
 #define TOUCH_PROJECT_LEGACY 0x542F    // older firmware that must not get the acknowledgement
-#define TOUCH_STALE_US 300000          // a finger on the glass keeps producing reports; this much silence = gone
 
 static i2c_master_dev_handle_t s_touch;
 static bool s_touch_ack = true;
-static int64_t s_touch_last_report;
-static uint32_t s_touch_reports, s_touch_errors, s_touch_stale;
+static cst_tracker_t s_tracker;
+static uint32_t s_touch_reports, s_touch_failed, s_touch_cancelled;
 
 static esp_err_t touch_read_reg(uint16_t reg, uint8_t *buf, size_t len)
 {
@@ -52,62 +52,42 @@ static esp_err_t touch_read_reg(uint16_t reg, uint8_t *buf, size_t len)
     return err == ESP_OK ? i2c_master_receive(s_touch, buf, len, 20) : err;
 }
 
-// esp_lcd_touch read_data: decode one report into tp->data. Always returns ESP_OK; errors keep the last state.
-static esp_err_t touch_read(esp_lcd_touch_handle_t tp)
+static void touch_indev_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
-    uint8_t r[TOUCH_REPORT_LEN] = {0};
-    int points = -1;  // -1: no new report
-    uint16_t x = 0, y = 0;
-    if (touch_read_reg(0xD000, r, sizeof(r)) != ESP_OK) {
-        s_touch_errors++;
-    } else {
-        if (s_touch_ack) {  // releases the report so the controller can publish the next one
-            static const uint8_t ack[3] = {0xD0, 0x00, 0xAB};
-            if (i2c_master_transmit(s_touch, ack, sizeof(ack), 20) != ESP_OK) s_touch_errors++;
-        }
-        bool empty = true;
-        for (int i = 0; i < 7; i++) empty = empty && r[i] == 0;
-        int n = r[5] & 0x7F;
-        if (empty) {
-            points = 0;
-        } else if (r[0] != 0xAB && r[6] == 0xAB && n <= 2) {  // r[0] == 0xAB: nothing new since the last one
-            points = 0;
-            for (int i = 0; i < n; i++) {
-                const uint8_t *p = &r[i == 0 ? 0 : i * 5 + 2];
-                if (((p[0] & 0x0F) >> 1) == 3) {  // release records keep the old position, so filter on status
-                    x = (uint16_t)(p[1] << 4 | p[3] >> 4);
-                    y = (uint16_t)(p[2] << 4 | (p[3] & 0x0F));
-                    points = 1;
-                    break;
-                }
-            }
-        }
+    uint8_t r[CST92XX_REPORT_LEN] = {0};
+    bool read_ok = touch_read_reg(0xD000, r, sizeof(r)) == ESP_OK, ack_ok = true;
+    if (read_ok && s_touch_ack) {  // releases the report so the controller can publish the next one
+        static const uint8_t ack[3] = {0xD0, 0x00, 0xAB};
+        ack_ok = i2c_master_transmit(s_touch, ack, sizeof(ack), 20) == ESP_OK;
     }
-    int64_t now = esp_timer_get_time();
-    if (points >= 0) {
-        s_touch_reports++;
-        s_touch_last_report = now;
+    cst_sample_t smp = cst92xx_decode(r, read_ok, ack_ok);
+    if (smp.kind == CST_SAMPLE_FAILED) s_touch_failed++;
+    else if (smp.kind != CST_SAMPLE_NO_NEWS) s_touch_reports++;
+
+    data->state = LV_INDEV_STATE_RELEASED;
+    switch (cst92xx_track(&s_tracker, smp, esp_timer_get_time())) {
+    case CST_OUT_DOWN:
+        data->state = LV_INDEV_STATE_PRESSED;
+        break;
+    case CST_OUT_CANCEL:
+        s_touch_cancelled++;
+        // A drag ends as if the finger were lifted: the cards snap into place, and LVGL never counts a drag as
+        // a tap. Anything else gets PRESS_LOST instead of RELEASED and CLICKED.
+        if (!lv_indev_get_scroll_obj(indev)) lv_indev_wait_release(indev);
+        break;
+    case CST_OUT_UP:
+        break;
     }
-    portENTER_CRITICAL(&tp->data.lock);
-    if (points >= 0) {
-        tp->data.points = points;
-        if (points) {
-            tp->data.coords[0].x = x;
-            tp->data.coords[0].y = y;
-            tp->data.coords[0].strength = 1;
-            tp->data.coords[0].track_id = 0;
-        }
-    } else if (tp->data.points && now - s_touch_last_report > TOUCH_STALE_US) {
-        tp->data.points = 0;  // never hold a finger that has stopped reporting
-        s_touch_stale++;
-    }
-    portEXIT_CRITICAL(&tp->data.lock);
-    return ESP_OK;
+    // Controller to screen as bsp_display_start() configured it (mirror y, then swap). Clamped: LVGL logs a
+    // warning over the slow UART for every point outside the screen.
+    int sx = KP_SCREEN_H - s_tracker.y, sy = s_tracker.x;
+    data->point.x = sx < 0 ? 0 : sx >= KP_SCREEN_W ? KP_SCREEN_W - 1 : sx;
+    data->point.y = sy < 0 ? 0 : sy >= KP_SCREEN_H ? KP_SCREEN_H - 1 : sy;
 }
 
 static void touch_start(lv_display_t *disp)
 {
-    // Same orientation as bsp_display_start(). The Waveshare driver still does the reset and setup.
+    // The Waveshare driver still resets and sets up the controller.
     bsp_display_cfg_t cfg = {.touch_flags = {.swap_xy = 1, .mirror_x = 0, .mirror_y = 1}};
     esp_lcd_touch_handle_t tp = NULL;
     if (bsp_touch_new(&cfg, &tp) != ESP_OK || !tp) {
@@ -119,22 +99,26 @@ static void touch_start(lv_display_t *disp)
         .device_address = TOUCH_ADDR,
         .scl_speed_hz = 400000,
     };
-    if (i2c_master_bus_add_device(bsp_i2c_get_handle(), &dc, &s_touch) == ESP_OK) {
-        uint8_t id[4] = {0};
-        if (touch_read_reg(0xD204, id, sizeof(id)) == ESP_OK) {
-            uint16_t project = id[0] | id[1] << 8, chip = id[2] | id[3] << 8;
-            s_touch_ack = project != TOUCH_PROJECT_LEGACY;
-            ESP_LOGI(TAG, "touch chip 0x%04x, project 0x%04x", chip, project);
-        }
-        tp->read_data = touch_read;
-        gpio_intr_disable(tp->config.int_gpio_num);
-        tp->config.int_gpio_num = GPIO_NUM_NC;  // the adapter polls when there is no interrupt pin
-    } else {
+    if (i2c_master_bus_add_device(bsp_i2c_get_handle(), &dc, &s_touch) != ESP_OK) {
         s_touch = NULL;
         ESP_LOGW(TAG, "touch: using the Waveshare driver");
+        esp_lv_adapter_touch_config_t tc = ESP_LV_ADAPTER_TOUCH_DEFAULT_CONFIG(disp, tp);
+        if (!esp_lv_adapter_register_touch(&tc)) ESP_LOGW(TAG, "touch registration failed");
+        return;
     }
-    esp_lv_adapter_touch_config_t tc = ESP_LV_ADAPTER_TOUCH_DEFAULT_CONFIG(disp, tp);
-    if (!esp_lv_adapter_register_touch(&tc)) ESP_LOGW(TAG, "touch registration failed");
+    uint8_t id[4] = {0};
+    if (touch_read_reg(0xD204, id, sizeof(id)) == ESP_OK) {
+        uint16_t project = id[0] | id[1] << 8, chip = id[2] | id[3] << 8;
+        s_touch_ack = project != TOUCH_PROJECT_LEGACY;
+        ESP_LOGI(TAG, "touch chip 0x%04x, project 0x%04x", chip, project);
+    }
+    gpio_intr_disable(tp->config.int_gpio_num);
+    board_lock(-1);
+    lv_indev_t *indev = lv_indev_create();
+    lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(indev, touch_indev_read);
+    lv_indev_set_display(indev, disp);
+    board_unlock();
 }
 
 // The CO5300 needs areas that start on an even and end on an odd pixel (as in the BSP).
@@ -252,8 +236,8 @@ void board_diag(char *buf, size_t len)
         snprintf(buf, len, "touch: Waveshare driver");
         return;
     }
-    snprintf(buf, len, "touch: %lu reports, %lu read errors, %lu stuck presses cleared%s",
-             (unsigned long)s_touch_reports, (unsigned long)s_touch_errors, (unsigned long)s_touch_stale,
+    snprintf(buf, len, "touch: %lu reports, %lu failed reads, %lu presses cancelled%s",
+             (unsigned long)s_touch_reports, (unsigned long)s_touch_failed, (unsigned long)s_touch_cancelled,
              s_touch_ack ? "" : " (older touch firmware)");
 }
 
