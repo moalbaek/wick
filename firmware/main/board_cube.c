@@ -158,7 +158,11 @@ static const uint16_t *volatile s_frame;
 static uint16_t *s_slice[2];
 static volatile bool s_first_frame_sent;
 static int s_brightness = 100;
-static uint32_t s_frames_sent, s_frame_us_total, s_frame_us_max, s_send_errors;
+// Send-time statistics for the settings page. The total is 64-bit (32 bits of microseconds wrap after ~72
+// minutes of sending), which this 32-bit CPU can't read in one go, so the sender and the HTTP task share a lock.
+static portMUX_TYPE s_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+static uint64_t s_frame_us_total;
+static uint32_t s_frames_sent, s_frame_us_max, s_send_errors;
 
 static bool IRAM_ATTR on_color_done(esp_lcd_panel_io_handle_t io, esp_lcd_panel_io_event_data_t *e, void *ctx)
 {
@@ -206,9 +210,11 @@ static void sender_task(void *arg)
         }
         xSemaphoreGive(s_panel_mutex);
         uint32_t us = (uint32_t)(esp_timer_get_time() - t0);
+        taskENTER_CRITICAL(&s_stats_lock);
         s_frames_sent++;
         s_frame_us_total += us;
         if (us > s_frame_us_max) s_frame_us_max = us;
+        taskEXIT_CRITICAL(&s_stats_lock);
         xSemaphoreGive(s_frame_sent);
     }
 }
@@ -336,9 +342,13 @@ lv_display_t *board_init(void)
 
 void board_diag(char *buf, size_t len)
 {
-    int n = snprintf(buf, len, "frames sent: %lu, average %lu ms, slowest %lu ms%s · ", (unsigned long)s_frames_sent,
-                     (unsigned long)(s_frames_sent ? s_frame_us_total / s_frames_sent / 1000 : 0),
-                     (unsigned long)(s_frame_us_max / 1000), s_send_errors ? ", send errors" : "");
+    taskENTER_CRITICAL(&s_stats_lock);
+    uint64_t total = s_frame_us_total;
+    uint32_t frames = s_frames_sent, max_us = s_frame_us_max, errors = s_send_errors;
+    taskEXIT_CRITICAL(&s_stats_lock);
+    int n = snprintf(buf, len, "frames sent: %lu, average %lu ms, slowest %lu ms%s · ", (unsigned long)frames,
+                     (unsigned long)(frames ? total / frames / 1000 : 0), (unsigned long)(max_us / 1000),
+                     errors ? ", send errors" : "");
     if (n < 0 || (size_t)n >= len) return;
     if (!s_touch) {
         snprintf(buf + n, len - n, "touch: Waveshare driver");
