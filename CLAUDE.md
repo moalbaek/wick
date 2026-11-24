@@ -51,6 +51,11 @@ make -C sim
 - **Taps carry a token.** `CMD_PLAY` includes `s_list_token`; bump it whenever the song list on screen
   changes so stale taps are ignored.
 - One entry type for everything on screen: `sp_entry_t` (`kind` = playlist, album, track, liked, search).
+- Kids mode draws a scene (`s_scenes` in `ui.c`) on the display's bottom layer under every screen; the screen
+  turns transparent. A new random scene is picked only while the panel is dark (`dim_screen`). The whole frame
+  is redrawn every frame while swiping, so scene cost matters: keep shapes small, avoid big arcs/circles (LVGL
+  masks every pixel of their bounding box). Measured per frame (host instructions, `callgrind`): black 0.75 M,
+  confetti 1.4 M, night 1.8 M, sea 2.0 M, rainbow 2.7 M. Check new scenes the same way.
 - Settings live in NVS namespace `kp` (`settings.c`); add new keys there with a board-specific default.
   The `kp`/`KP_` names are from the old name and stay: renaming the namespace would wipe saved settings.
 - Internal RAM is tight (Wi-Fi, TLS, DMA). Big buffers go to PSRAM (`heap_caps_*(…, MALLOC_CAP_SPIRAM)`).

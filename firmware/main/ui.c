@@ -6,6 +6,7 @@
 #include "kp_util.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -16,8 +17,10 @@ LV_FONT_DECLARE(kp_font_32);
 #define COL_BG lv_color_hex(0x000000)
 #define COL_CARD lv_color_hex(0x262626)
 #define COL_TEXT lv_color_hex(0xFFFFFF)
-#define COL_MUTED lv_color_hex(0xB3B3B3)
+#define COL_MUTED lv_color_hex(s_kids ? 0xE4E4F0 : 0xB3B3B3)  // lighter on the kids' coloured scenes
 #define COL_ACCENT lv_color_hex(0x1ED760)
+
+static bool s_kids;  // kids mode: a playful scene behind the screens (see "kids backdrop")
 
 #if CONFIG_KP_BOARD_CUBE
 #define IS_CUBE 1
@@ -147,6 +150,329 @@ static void update_badges(void)
     if (s_play_btn_label) lv_label_set_text(s_play_btn_label, s_np_playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 }
 
+// ---------------------------------------------------------------- kids backdrop
+// In kids mode the screens sit on a playful scene instead of black. It is drawn on the display's bottom layer,
+// under every screen, so clear_screen() never touches it; the screen turns transparent while it is shown. A new
+// scene is picked at random each time the screen has gone dark, so waking the player shows a surprise.
+//
+// Scenes are laid out in 480x480 design space with the shapes in the margins around the cover and below the
+// text, so nothing cuts through a title. A wide screen stretches the positions and keeps shapes round. Shapes
+// that overlap are opaque: translucent ones would show a seam where they overlap.
+
+typedef struct {
+    uint32_t top, bottom;  // sky: vertical gradient
+    void (*draw)(lv_layer_t *L);
+} scene_t;
+
+static int s_scene = -1;  // index into s_scenes; -1: plain black
+static bool s_scene_due;  // pick a new scene once the screen is dark
+
+#define BD_SX (KP_SCREEN_W * 256 / 480)  // design space -> screen, in 1/256
+#define BD_SY (KP_SCREEN_H * 256 / 480)
+#define BD_SS (KP_SCREEN_W == KP_SCREEN_H ? BD_SY : (KP_SCREEN_W < KP_SCREEN_H ? BD_SX : BD_SY) * 3 / 2)
+
+static int32_t bx(int32_t x) { return x * BD_SX / 256; }
+static int32_t by(int32_t y) { return y * BD_SY / 256; }
+static int32_t bs(int32_t v) { int32_t r = v * BD_SS / 256; return r > 0 ? r : 1; }
+
+static uint32_t mix(uint32_t a, uint32_t b, int32_t t)  // t/256 of a, the rest b
+{
+    uint32_t r = 0;
+    for (int sh = 0; sh <= 16; sh += 8)
+        r |= ((((a >> sh) & 0xFF) * t + ((b >> sh) & 0xFF) * (256 - t)) >> 8) << sh;
+    return r;
+}
+
+// Screen-space primitives.
+
+static void px_rect(lv_layer_t *L, int32_t cx, int32_t cy, int32_t w, int32_t h, int32_t radius, uint32_t col,
+                    lv_opa_t opa)
+{
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.bg_color = lv_color_hex(col);
+    d.bg_opa = opa;
+    d.radius = radius;
+    lv_area_t a = {cx - w / 2, cy - h / 2, cx - w / 2 + w - 1, cy - h / 2 + h - 1};
+    lv_draw_rect(L, &d, &a);
+}
+
+static void px_circle(lv_layer_t *L, int32_t cx, int32_t cy, int32_t r, uint32_t col)
+{
+    px_rect(L, cx, cy, 2 * r, 2 * r, LV_RADIUS_CIRCLE, col, LV_OPA_COVER);
+}
+
+static void px_tri(lv_layer_t *L, int32_t x1, int32_t y1, int32_t x2, int32_t y2, int32_t x3, int32_t y3,
+                   uint32_t col)
+{
+    lv_draw_triangle_dsc_t d;
+    lv_draw_triangle_dsc_init(&d);
+    d.p[0].x = x1;
+    d.p[0].y = y1;
+    d.p[1].x = x2;
+    d.p[1].y = y2;
+    d.p[2].x = x3;
+    d.p[2].y = y3;
+    d.color = lv_color_hex(col);
+    d.opa = LV_OPA_COVER;
+    lv_draw_triangle(L, &d);
+}
+
+// Shapes, placed in design space.
+
+static void dot(lv_layer_t *L, int32_t x, int32_t y, int32_t r, uint32_t col) { px_circle(L, bx(x), by(y), bs(r), col); }
+
+// Big circle mostly below the screen, placed by its top edge: on a wide screen it then stays as low as on the
+// square one instead of growing up behind the text.
+static void mound(lv_layer_t *L, int32_t x, int32_t top, int32_t r, uint32_t col)
+{
+    px_circle(L, bx(x), by(top) + bs(r), bs(r), col);
+}
+
+static void bar(lv_layer_t *L, int32_t x, int32_t y, int32_t w, int32_t h, uint32_t col)
+{
+    px_rect(L, bx(x), by(y), bs(w), bs(h), LV_RADIUS_CIRCLE, col, LV_OPA_COVER);
+}
+
+static void square(lv_layer_t *L, int32_t x, int32_t y, int32_t s, uint32_t col)
+{
+    px_rect(L, bx(x), by(y), bs(s), bs(s), bs(3), col, LV_OPA_COVER);
+}
+
+static void triangle(lv_layer_t *L, int32_t x, int32_t y, int32_t s, uint32_t col)
+{
+    int32_t cx = bx(x), cy = by(y), S = bs(s);
+    px_tri(L, cx - S / 2, cy + S * 2 / 5, cx + S / 2, cy + S * 2 / 5, cx, cy - S / 2, col);
+}
+
+// Four-pointed twinkle: a dot with four tapered arms that start inside it, so no two edges meet exactly.
+static void twinkle(lv_layer_t *L, int32_t x, int32_t y, int32_t r, uint32_t col)
+{
+    int32_t cx = bx(x), cy = by(y), R = bs(r), w = bs(r) / 4 + 1;
+    px_circle(L, cx, cy, w, col);
+    px_tri(L, cx - w, cy, cx + w, cy, cx, cy - R, col);
+    px_tri(L, cx - w, cy, cx + w, cy, cx, cy + R, col);
+    px_tri(L, cx, cy - w, cx, cy + w, cx - R, cy, col);
+    px_tri(L, cx, cy - w, cx, cy + w, cx + R, cy, col);
+}
+
+// Chubby five-pointed star: a round middle with five tips.
+static void star(lv_layer_t *L, int32_t x, int32_t y, int32_t r, uint32_t col)
+{
+    int32_t cx = bx(x), cy = by(y), R = bs(r), ri = bs(r) * 45 / 100;
+    px_circle(L, cx, cy, ri, col);
+    for (int k = 0; k < 5; k++) {
+        int32_t a = 270 + k * 72;
+        px_tri(L, cx + ri * lv_trigo_cos(a - 40) / 32767, cy + ri * lv_trigo_sin(a - 40) / 32767,
+               cx + ri * lv_trigo_cos(a + 40) / 32767, cy + ri * lv_trigo_sin(a + 40) / 32767,
+               cx + R * lv_trigo_cos(a) / 32767, cy + R * lv_trigo_sin(a) / 32767, col);
+    }
+}
+
+static void cloud(lv_layer_t *L, int32_t x, int32_t y, int32_t s, uint32_t col)
+{
+    int32_t cx = bx(x), cy = by(y), S = bs(s);
+    px_rect(L, cx, cy + S / 4, S * 2, S * 3 / 4, LV_RADIUS_CIRCLE, col, LV_OPA_COVER);
+    px_circle(L, cx - S / 3, cy, S / 2, col);
+    px_circle(L, cx + S / 4, cy - S / 8, S * 2 / 3, col);
+}
+
+static void bubble(lv_layer_t *L, int32_t x, int32_t y, int32_t r)
+{
+    int32_t cx = bx(x), cy = by(y), R = bs(r);
+    lv_draw_rect_dsc_t d;
+    lv_draw_rect_dsc_init(&d);
+    d.bg_opa = LV_OPA_TRANSP;  // a ring only: a translucent fill costs as much again to draw
+    d.border_color = lv_color_white();
+    d.border_opa = LV_OPA_70;
+    d.border_width = R > 10 ? 3 : 2;
+    d.radius = LV_RADIUS_CIRCLE;
+    lv_area_t a = {cx - R, cy - R, cx + R, cy + R};
+    lv_draw_rect(L, &d, &a);
+    px_rect(L, cx - R / 3, cy - R / 3, R / 2 + 2, R / 2 + 2, LV_RADIUS_CIRCLE, 0xFFFFFF, LV_OPA_80);
+}
+
+static void fish(lv_layer_t *L, int32_t x, int32_t y, int32_t s, uint32_t col, bool facing_left)
+{
+    int32_t cx = bx(x), cy = by(y), S = bs(s), d = facing_left ? 1 : -1;
+    int32_t tail = cx + d * S * 9 / 10;
+    px_tri(L, cx + d * S / 2, cy, tail, cy - S * 2 / 5, tail, cy + S * 2 / 5, col);
+    px_rect(L, cx, cy, S * 3 / 2, S, LV_RADIUS_CIRCLE, col, LV_OPA_COVER);
+    px_circle(L, cx - d * S * 2 / 5, cy - S / 8, S / 8 + 1, 0x0C2A4A);
+}
+
+static void flower(lv_layer_t *L, int32_t x, int32_t y, uint32_t col, uint32_t middle)
+{
+    dot(L, x, y, 7, col);
+    dot(L, x, y, 3, middle);
+}
+
+static uint32_t sky_at(const scene_t *sc, int32_t screen_y)
+{
+    return mix(sc->bottom, sc->top, screen_y * 256 / KP_SCREEN_H);
+}
+
+// Scenes.
+
+enum { YEL = 0xFFD23F, PNK = 0xFF5D8F, MNT = 0x3DDC97, SKY = 0x4CC9F0, ORG = 0xFF9F1C, LIL = 0xC77DFF,
+       WHT = 0xFFFFFF, MOON = 0xFFE27A };
+
+static void draw_confetti(lv_layer_t *L)
+{
+    enum { DOT, SQUARE, TRI, BAR, UPRIGHT, TWINKLE };
+    static const uint32_t c[][5] = {  // x, y, shape, size, colour
+        {30, 118, DOT, 9, YEL},       {64, 152, SQUARE, 14, MNT},  {24, 196, TRI, 18, PNK},
+        {62, 232, DOT, 6, SKY},       {34, 270, BAR, 26, ORG},     {66, 304, TWINKLE, 12, YEL},
+        {26, 338, DOT, 10, LIL},      {58, 92, UPRIGHT, 22, SKY},  {118, 22, SQUARE, 12, PNK},
+        {166, 14, DOT, 6, YEL},       {206, 28, BAR, 24, SKY},     {262, 16, DOT, 8, MNT},
+        {302, 30, TRI, 15, ORG},      {350, 18, TWINKLE, 11, LIL}, {440, 80, DOT, 8, MNT},
+        {414, 112, UPRIGHT, 24, PNK}, {452, 150, TRI, 18, YEL},    {420, 192, DOT, 11, SKY},
+        {456, 230, SQUARE, 14, ORG},  {418, 266, TWINKLE, 13, MNT}, {450, 304, DOT, 7, PNK},
+        {424, 338, BAR, 22, YEL},     {36, 462, DOT, 8, PNK},      {92, 470, BAR, 24, MNT},
+        {150, 458, SQUARE, 10, YEL},  {330, 466, DOT, 7, SKY},     {384, 458, TRI, 15, PNK},
+        {440, 466, DOT, 10, ORG},
+    };
+    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int32_t x = (int32_t)c[i][0], y = (int32_t)c[i][1], s = (int32_t)c[i][3];
+        uint32_t col = c[i][4];
+        switch (c[i][2]) {
+        case DOT: dot(L, x, y, s, col); break;
+        case SQUARE: square(L, x, y, s, col); break;
+        case TRI: triangle(L, x, y, s, col); break;
+        case BAR: bar(L, x, y, s, 9, col); break;
+        case UPRIGHT: bar(L, x, y, 9, s, col); break;
+        default: twinkle(L, x, y, s, col); break;
+        }
+    }
+}
+
+static void draw_night(lv_layer_t *L);
+static void draw_sea(lv_layer_t *L);
+static void draw_rainbow(lv_layer_t *L);
+
+static const scene_t s_scenes[] = {
+    {0x6A2C91, 0x2B1A66, draw_confetti},
+    {0x12185A, 0x3A1F6E, draw_night},
+    {0x1A8FB5, 0x0C3B6B, draw_sea},
+    {0x2A63C9, 0x4A8FE0, draw_rainbow},
+};
+#define N_SCENES ((int)(sizeof(s_scenes) / sizeof(s_scenes[0])))
+
+static void draw_night(lv_layer_t *L)
+{
+    const scene_t *sc = &s_scenes[1];
+    int32_t mx = bx(434), my = by(120);
+    px_circle(L, mx, my, bs(30), MOON);
+    px_circle(L, mx + bs(13), my - bs(11), bs(26), sky_at(sc, my - bs(11)));  // the bite that makes it a crescent
+    static const uint32_t tw[][4] = {
+        {40, 130, 14, MOON}, {62, 252, 9, WHT},   {420, 222, 12, MOON}, {450, 300, 8, WHT},
+        {150, 24, 10, WHT},  {330, 22, 13, MOON}, {26, 330, 8, MOON},   {244, 12, 6, WHT},
+    };
+    for (size_t i = 0; i < sizeof(tw) / sizeof(tw[0]); i++)
+        twinkle(L, (int32_t)tw[i][0], (int32_t)tw[i][1], (int32_t)tw[i][2], tw[i][3]);
+    static const int16_t dots[][2] = {
+        {20, 70},  {70, 196},  {30, 288},  {58, 330},  {108, 36}, {196, 30}, {286, 36},  {380, 30},
+        {412, 70}, {460, 180}, {402, 276}, {466, 336}, {74, 100}, {20, 228}, {458, 250}, {410, 164},
+    };
+    for (size_t i = 0; i < sizeof(dots) / sizeof(dots[0]); i++)
+        px_rect(L, bx(dots[i][0]), by(dots[i][1]), bs(i % 3 ? 4 : 6), bs(i % 3 ? 4 : 6), LV_RADIUS_CIRCLE, WHT,
+                i % 2 ? LV_OPA_70 : LV_OPA_COVER);
+    uint32_t cl = mix(WHT, sc->bottom, 56);
+    cloud(L, 40, 474, 40, cl);
+    cloud(L, 120, 486, 34, cl);
+    cloud(L, 370, 488, 36, cl);
+    cloud(L, 446, 472, 44, cl);
+}
+
+static void draw_sea(lv_layer_t *L)
+{
+    const uint32_t weed = 0x1FA36B, sand = 0xE8C27A;
+    for (int i = 0; i < 6; i++) {  // seaweed: wavy columns of blobs
+        dot(L, 18 + ((i & 1) ? 7 : -3), 476 - i * 22, 12, weed);
+        dot(L, 462 + ((i & 1) ? -7 : 3), 480 - i * 20, 11, weed);
+    }
+    for (int i = 0; i < 3; i++) dot(L, 52 + ((i & 1) ? 5 : -3), 480 - i * 20, 10, 0x2BC27E);
+    mound(L, 110, 456, 110, sand);
+    mound(L, 300, 454, 132, mix(sand, 0xC99A52, 200));
+    star(L, 150, 470, 13, 0xFF7A45);
+    star(L, 330, 472, 11, PNK);
+    fish(L, 238, 22, 26, 0xFFB347, true);
+    fish(L, 44, 300, 22, PNK, false);
+    fish(L, 440, 230, 20, YEL, true);
+    static const int16_t b[][3] = {
+        {40, 120, 16}, {66, 170, 9},   {30, 214, 12}, {436, 96, 10}, {452, 150, 18},
+        {448, 280, 13}, {420, 322, 6}, {130, 24, 9},  {360, 20, 12},
+    };
+    for (size_t i = 0; i < sizeof(b) / sizeof(b[0]); i++) bubble(L, b[i][0], b[i][1], b[i][2]);
+}
+
+static void draw_rainbow(lv_layer_t *L)
+{
+    // A quarter rainbow sweeping out of the top-right corner, landing on a cloud. Arc cost grows with the square of
+    // the radius (every pixel of its bounding box is masked), and the cube redraws the whole frame while swiping:
+    // a half-circle rainbow around the cover cost three times a black frame on its own.
+    static const uint32_t bands[] = {0xFF595E, 0xFF924C, 0xFFCA3A, 0x8AC926, 0x52D1DC, 0x9B5DE5};
+    lv_draw_arc_dsc_t a;
+    lv_draw_arc_dsc_init(&a);
+    a.center.x = bx(492);
+    a.center.y = by(-12);
+    a.start_angle = 90;
+    a.end_angle = 180;
+    for (int i = 0; i < 6; i++) {  // each band overlaps the next by a pixel, so no gap shows between them
+        a.radius = bs(122 - i * 9);
+        a.width = bs(10);
+        a.color = lv_color_hex(bands[i]);
+        lv_draw_arc(L, &a);
+    }
+    dot(L, 24, 24, 56, YEL);  // sun
+    cloud(L, 196, 22, 28, WHT);
+    cloud(L, 446, 112, 26, WHT);
+    dot(L, 420, 760, 340, 0x3DAA5C);  // hills
+    dot(L, 50, 742, 330, 0x2A8C4A);
+    flower(L, 30, 448, PNK, YEL);
+    flower(L, 80, 466, YEL, ORG);
+    flower(L, 130, 466, WHT, YEL);
+    flower(L, 372, 470, LIL, YEL);
+    flower(L, 416, 466, PNK, YEL);
+    flower(L, 458, 456, YEL, ORG);
+}
+
+static void scene_draw_cb(lv_event_t *e)
+{
+    if (s_scene >= 0) s_scenes[s_scene].draw(lv_event_get_layer(e));
+}
+
+static void show_scene(int i)
+{
+    lv_obj_t *bl = lv_layer_bottom();
+    s_scene = i;
+    if (i >= 0) {
+        lv_obj_set_style_bg_color(bl, lv_color_hex(s_scenes[i].top), 0);
+        lv_obj_set_style_bg_grad_color(bl, lv_color_hex(s_scenes[i].bottom), 0);
+        lv_obj_set_style_bg_grad_dir(bl, LV_GRAD_DIR_VER, 0);
+        lv_obj_set_style_bg_opa(bl, LV_OPA_COVER, 0);
+    }
+    // An opaque screen hides the bottom layer, and LVGL then skips drawing it.
+    lv_obj_set_style_bg_opa(s_root, i >= 0 ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+    lv_obj_invalidate(bl);
+}
+
+static int random_scene(void)
+{
+    if (s_scene < 0) return (int)(esp_random() % N_SCENES);
+    return (s_scene + 1 + (int)(esp_random() % (N_SCENES - 1))) % N_SCENES;  // never the same twice in a row
+}
+
+void ui_set_kids_mode(bool kids)
+{
+    board_lock(-1);
+    if (kids != s_kids) {
+        s_kids = kids;
+        show_scene(kids ? random_scene() : -1);
+    }
+    board_unlock();
+}
+
 // ---------------------------------------------------------------- periodic work (runs in the LVGL task)
 
 static void manage_images(void)
@@ -207,6 +533,13 @@ static void dim_screen(void)
     uint32_t idle = lv_display_get_inactive_time(NULL);
     int want = idle < 60000 ? 100 : (idle < 300000 ? 25 : 0);
     s_desired_brightness = want;
+    // A new scene only while the screen is off, so the next wake-up shows it and it never changes in view.
+    if (want > 0) {
+        s_scene_due = true;
+    } else if (s_kids && s_scene_due && s_applied_brightness == 0) {
+        show_scene(random_scene());
+        s_scene_due = false;
+    }
     if (want == 0 && !s_wake_catcher) {
         s_wake_catcher = lv_obj_create(lv_layer_sys());
         lv_obj_remove_style_all(s_wake_catcher);
@@ -337,6 +670,7 @@ void ui_init(lv_display_t *disp)
     lv_obj_set_style_bg_color(s_root, COL_BG, 0);
     lv_obj_set_style_bg_opa(s_root, LV_OPA_COVER, 0);
     lv_obj_set_scrollable(s_root, false);
+    lv_obj_add_event_cb(lv_display_get_layer_bottom(disp), scene_draw_cb, LV_EVENT_DRAW_MAIN_END, NULL);
     make_overlays();
     lv_timer_create(tick_cb, TICK_MS, NULL);
     lv_display_add_event_cb(disp, render_ready_cb, LV_EVENT_RENDER_READY, NULL);

@@ -622,6 +622,7 @@ static void handle(const app_cmd_t *c)
         break;
     case CMD_SETTINGS_CHANGED:
         board_apply_rotation();
+        ui_set_kids_mode(!full_mode());
         sonos_reset_cache();
         s_home_focus = 0;
         if (s_parent_open) {
@@ -699,6 +700,7 @@ void app_main(void)
 
     lv_display_t *disp = board_init();
     ui_init(disp);
+    ui_set_kids_mode(!full_mode());
     ui_show_message(LV_SYMBOL_AUDIO, KP_DEVICE_NAME, "Starting…", false);
     images_init();
     wifi_init();

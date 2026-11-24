@@ -11,6 +11,7 @@
 #include <time.h>
 
 static uint16_t *fb;
+uint32_t sim_random_next;  // what esp_random() returns (stub/esp_random.h)
 static uint32_t now_ms;
 static uint32_t tick(void) { return now_ms; }
 
@@ -131,5 +132,21 @@ int main(void)
     ui_toast("Playing This Is Kim Larsen"); shot("9_toast");
     run(4000);
     ui_show_parent("http://192.168.100.100/?key=0123456789abcdefghijkw", "Stue"); shot("10_parent");
+
+    // Kids mode: every scene behind the home screen and a song list. The first scene is esp_random() % 4.
+    sp_entry_t kh[2], ks[2];
+    kh[0] = E(SP_KIND_PLAYLIST, "1aaaaaaaaaaaaaaaaaaaaa", "Frida", "", "u1");
+    kh[1] = E(SP_KIND_PLAYLIST, "2bbbbbbbbbbbbbbbbbbbbb", "Godnat", "", "u2");
+    ks[0] = E(SP_KIND_TRACK, "bbbbbbbbbbbbbbbbbbbbb1", "Lille Peter Edderkop", "Sigurd Barrett", "u8");
+    ks[1] = E(SP_KIND_TRACK, "bbbbbbbbbbbbbbbbbbbbb2", "Mariehønen Evigglad", "Sigurd Barrett", "u9");
+    ui_set_now_playing("bbbbbbbbbbbbbbbbbbbbb1", true);
+    for (int s = 0; s < 4; s++) {
+        char name[32];
+        sim_random_next = s;
+        ui_set_kids_mode(false);
+        ui_set_kids_mode(true);
+        ui_show_home(kh, 2, 0); snprintf(name, sizeof name, "11_kids%d_home", s + 1); shot(name);
+        ui_show_tracks(2, "Frida", ks, 2, true, 0); snprintf(name, sizeof name, "12_kids%d_songs", s + 1); shot(name);
+    }
     return 0;
 }

@@ -7,6 +7,10 @@
 
 void ui_init(lv_display_t *disp);
 
+// Kids mode puts a playful scene behind every screen (a different one each time the screen wakes up);
+// otherwise the background is black.
+void ui_set_kids_mode(bool kids);
+
 // Big icon (LV_SYMBOL_*), title and a line of text. spinner shows activity.
 void ui_show_message(const char *icon, const char *title, const char *text, bool spinner);
 
