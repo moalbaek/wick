@@ -21,6 +21,7 @@ network for playback.
 | | Kids mode | Whole library |
 |---|---|---|
 | Home screen | Playlists whose name starts with `Kids:` (prefix removed) | Search, Liked Songs, all playlists, saved albums |
+| Background | A playful scene (confetti, night sky, under the sea, rainbow hills), a new one each time the screen wakes | Black |
 | Default on | 2.16" cube | 3.49" strip |
 | Volume cap | 40 % | 100 % |
 
